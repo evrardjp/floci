@@ -82,7 +82,7 @@ public class AwsQueryController {
             "CreateGroup", "GetGroup", "DeleteGroup", "ListGroups",
             "AddUserToGroup", "RemoveUserFromGroup", "ListGroupsForUser",
             "CreateRole", "GetRole", "DeleteRole", "ListRoles", "UpdateRole",
-            "CreatePolicy", "GetPolicy", "DeletePolicy", "ListPolicies",
+            "CreatePolicy", "GetPolicy", "DeletePolicy", "ListPolicies", "ListEntitiesForPolicy",
             "CreatePolicyVersion", "GetPolicyVersion", "DeletePolicyVersion",
             "ListPolicyVersions", "SetDefaultPolicyVersion",
             "AttachUserPolicy", "DetachUserPolicy", "ListAttachedUserPolicies",
@@ -170,7 +170,7 @@ public class AwsQueryController {
             "ModifyLaunchTemplate", "DeleteLaunchTemplate",
             "DescribeNetworkInterfaces",
             "CreateFlowLogs", "DescribeFlowLogs", "DeleteFlowLogs",
-            "CreateVolume", "DescribeVolumes", "DeleteVolume"
+            "CreateVolume", "DescribeVolumes", "DeleteVolume", "AttachVolume", "DetachVolume"
     );
 
     private final CloudFormationQueryHandler cloudFormationQueryHandler;
@@ -391,6 +391,7 @@ public class AwsQueryController {
             "SetIdentityHeadersInNotificationsEnabled",
             "SetIdentityMailFromDomain", "GetIdentityMailFromDomainAttributes",
             "GetIdentityDkimAttributes",
+            "PutIdentityPolicy", "GetIdentityPolicies", "ListIdentityPolicies", "DeleteIdentityPolicy",
             "CreateTemplate", "UpdateTemplate", "GetTemplate", "DeleteTemplate",
             "ListTemplates", "SendTemplatedEmail", "SendBulkTemplatedEmail",
             "TestRenderTemplate",
@@ -404,7 +405,9 @@ public class AwsQueryController {
             "UpdateConfigurationSetTrackingOptions",
             "DeleteConfigurationSetTrackingOptions",
             "UpdateConfigurationSetReputationMetricsEnabled",
-            "PutConfigurationSetDeliveryOptions"
+            "PutConfigurationSetDeliveryOptions",
+            "CreateReceiptRuleSet", "DescribeReceiptRuleSet", "ListReceiptRuleSets",
+            "DeleteReceiptRuleSet", "SetActiveReceiptRuleSet", "DescribeActiveReceiptRuleSet"
     );
 
     private static final Set<String> COGNITO_ACTIONS = Set.of(

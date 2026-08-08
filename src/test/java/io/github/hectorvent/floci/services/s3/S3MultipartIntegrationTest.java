@@ -247,11 +247,24 @@ class S3MultipartIntegrationTest {
             .body(containsString("<CopyPartResult"))
             .body(containsString("<ETag>"));
 
+        // Percent-encoded bucket/key separator: the AWS SDK for .NET encodes the whole
+        // copy source, so the header carries no literal slash.
+        given()
+            .header("x-amz-copy-source", BUCKET + "%2Fsource-for-copy.bin")
+            .header("x-amz-copy-source-range", "bytes=2-5")
+        .when()
+            .put("/" + BUCKET + "/copy-dest.bin?uploadId=" + copyUploadId + "&partNumber=3")
+        .then()
+            .statusCode(200)
+            .body(containsString("<CopyPartResult"))
+            .body(containsString("<ETag>"));
+
         // Complete the upload
         String completeXml = """
                 <CompleteMultipartUpload>
                     <Part><PartNumber>1</PartNumber><ETag>etag1</ETag></Part>
                     <Part><PartNumber>2</PartNumber><ETag>etag2</ETag></Part>
+                    <Part><PartNumber>3</PartNumber><ETag>etag3</ETag></Part>
                 </CompleteMultipartUpload>""";
         given()
             .contentType("application/xml")
@@ -261,13 +274,15 @@ class S3MultipartIntegrationTest {
         .then()
             .statusCode(200);
 
-        // Verify contents: full source + ranged slice
+        // Verify contents: full source, ranged slice, then the same slice copied
+        // through the percent-encoded separator. The last four bytes prove the
+        // encoded source resolved to the same object, not just that it returned 200.
         given()
         .when()
             .get("/" + BUCKET + "/copy-dest.bin")
         .then()
             .statusCode(200)
-            .body(equalTo("ABCDEFGHIJCDEF"));
+            .body(equalTo("ABCDEFGHIJCDEFCDEF"));
     }
 
     @Test
@@ -486,8 +501,67 @@ class S3MultipartIntegrationTest {
 
     @Test
     @Order(18)
+    void multipartUploadAppliesInlineTagging() {
+        String taggedKey = "tagged-multipart.bin";
+        String taggingUploadId = given()
+            .header("x-amz-tagging", "token=abc-123&teamId=42&note=hello%20world")
+        .when()
+            .post("/" + BUCKET + "/" + taggedKey + "?uploads")
+        .then()
+            .statusCode(200)
+            .extract().xmlPath().getString("InitiateMultipartUploadResult.UploadId");
+
+        given()
+            .body("TaggedPartData")
+        .when()
+            .put("/" + BUCKET + "/" + taggedKey + "?uploadId=" + taggingUploadId + "&partNumber=1")
+        .then()
+            .statusCode(200);
+
+        String completeXml = """
+                <CompleteMultipartUpload>
+                    <Part><PartNumber>1</PartNumber><ETag>etag1</ETag></Part>
+                </CompleteMultipartUpload>""";
+        given()
+            .contentType("application/xml")
+            .body(completeXml)
+        .when()
+            .post("/" + BUCKET + "/" + taggedKey + "?uploadId=" + taggingUploadId)
+        .then()
+            .statusCode(200);
+
+        // Tags from the x-amz-tagging header on CreateMultipartUpload must be present
+        // on the completed object, including URL-decoded values.
+        given()
+        .when()
+            .get("/" + BUCKET + "/" + taggedKey + "?tagging")
+        .then()
+            .statusCode(200)
+            .body(containsString("<Key>token</Key>"))
+            .body(containsString("<Value>abc-123</Value>"))
+            .body(containsString("<Key>teamId</Key>"))
+            .body(containsString("<Value>42</Value>"))
+            .body(containsString("<Key>note</Key>"))
+            .body(containsString("<Value>hello world</Value>"));
+    }
+
+    @Test
+    @Order(19)
+    void initiateMultipartUploadRejectsMalformedTaggingHeader() {
+        given()
+            .header("x-amz-tagging", "missing-equals-sign")
+        .when()
+            .post("/" + BUCKET + "/bad-tagging.bin?uploads")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidArgument"));
+    }
+
+    @Test
+    @Order(20)
     void cleanUp() {
         given().when().delete("/" + BUCKET + "/" + KEY).then().statusCode(204);
+        given().when().delete("/" + BUCKET + "/tagged-multipart.bin").then().statusCode(204);
         given().when().delete("/" + BUCKET + "/source-for-copy.bin").then().statusCode(204);
         given().when().delete("/" + BUCKET + "/copy-dest.bin").then().statusCode(204);
         given().when().delete("/" + BUCKET + "/sse-c-multipart.bin").then().statusCode(204);

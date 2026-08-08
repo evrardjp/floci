@@ -39,10 +39,12 @@ import org.jboss.logging.Logger;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
@@ -266,18 +268,32 @@ public class ApiGatewayExecuteController {
 
         // Find matching resource and method
         List<ApiGatewayResource> resources = apiGatewayService.getResources(region, apiId);
-        ApiGatewayResource matched = matchResource(resources, path);
-        if (matched == null) {
+        List<ApiGatewayResource> matchedResources = matchResources(resources, path);
+        if (matchedResources.isEmpty()) {
             return Response.status(404)
                     .entity(jsonMessage("Not Found"))
                     .type(MediaType.APPLICATION_JSON).build();
         }
 
-        MethodConfig method = matched.getResourceMethods().get(httpMethod.toUpperCase());
-        if (method == null) {
-            method = matched.getResourceMethods().get("ANY");
+        ApiGatewayResource matched = null;
+        MethodConfig method = null;
+        for (ApiGatewayResource r : matchedResources) {
+            if (r.getResourceMethods() != null && !r.getResourceMethods().isEmpty()) {
+                MethodConfig m = r.getResourceMethods().get(httpMethod.toUpperCase());
+                if (m == null) {
+                    m = r.getResourceMethods().get("ANY");
+                }
+                if (m != null) {
+                    matched = r;
+                    method = m;
+                }
+                // Once we match a path that has methods configured, we must not fall back
+                // to less specific sibling resources (e.g. /{proxy+}), even on method mismatch.
+                break;
+            }
         }
-        if (method == null) {
+
+        if (matched == null) {
             return Response.status(405)
                     .entity(jsonMessage("Method Not Allowed"))
                     .type(MediaType.APPLICATION_JSON).build();
@@ -706,14 +722,19 @@ public class ApiGatewayExecuteController {
         }
     }
 
-    private void putSingleValueHeaders(ObjectNode event, HttpHeaders headers) {
+    // Package-private for unit testing (see ApiGatewayExecuteControllerTest).
+    void putSingleValueHeaders(ObjectNode event, HttpHeaders headers) {
         ObjectNode headersNode = event.putObject("headers");
         headers.getRequestHeaders().forEach((name, values) -> {
-            if (!values.isEmpty()) headersNode.put(name, values.get(0));
+            // AWS collapses duplicate request headers to the LAST value in the single-value `headers`
+            // map (multiValueHeaders keeps every value). Taking the first value diverged from AWS.
+            if (!values.isEmpty()) {
+                headersNode.put(name, values.get(values.size() - 1));
+            }
         });
     }
 
-    private void putMultiValueHeaders(ObjectNode event, HttpHeaders headers) {
+    void putMultiValueHeaders(ObjectNode event, HttpHeaders headers) {
         ObjectNode mvHeaders = event.putObject("multiValueHeaders");
         headers.getRequestHeaders().forEach((name, values) -> {
             ArrayNode arr = mvHeaders.putArray(name);
@@ -746,7 +767,7 @@ public class ApiGatewayExecuteController {
         }
     }
 
-    private Response buildProxyResponse(InvokeResult result) {
+    Response buildProxyResponse(InvokeResult result) {
         if (result.getPayload() == null || result.getPayload().length == 0) {
             return Response.status(result.getFunctionError() != null ? 502 : result.getStatusCode()).build();
         }
@@ -773,9 +794,9 @@ public class ApiGatewayExecuteController {
                 String bodyStr = bodyNode.asText();
                 boolean isBase64 = node.path("isBase64Encoded").asBoolean(false);
                 byte[] bytes = isBase64 ? Base64.getDecoder().decode(bodyStr) : bodyStr.getBytes();
-                String ct = MediaType.APPLICATION_JSON;
-                JsonNode ctNode = node.path("headers").path("Content-Type");
-                if (!ctNode.isMissingNode() && !ctNode.isNull()) ct = ctNode.asText();
+                String ct = findHeaderIgnoreCase(multiHeaders, "Content-Type")
+                        .or(() -> findHeaderIgnoreCase(respHeaders, "Content-Type"))
+                        .orElse(MediaType.APPLICATION_JSON);
                 builder.entity(bytes).type(ct);
             }
             return builder.build();
@@ -783,6 +804,29 @@ public class ApiGatewayExecuteController {
             LOG.warnv("Failed to parse Lambda response: {0}", e.getMessage());
             return Response.status(502).entity(result.getPayload()).type(MediaType.APPLICATION_JSON).build();
         }
+    }
+
+    /**
+     * HTTP header names are case-insensitive on the wire (RFC 7230 §3.2), and Lambda proxy
+     * integrations commonly return lowercased names (e.g. the AWS Lambda Web Adapter emits
+     * "content-type", not "Content-Type"). A plain JsonNode#path lookup is exact-case and
+     * silently misses those, so Content-Type detection needs to scan case-insensitively.
+     * Handles both the "headers" shape (single string value) and the "multiValueHeaders"
+     * shape (array value, first element wins).
+     */
+    private static Optional<String> findHeaderIgnoreCase(JsonNode headersNode, String name) {
+        if (headersNode == null || !headersNode.isObject()) {
+            return Optional.empty();
+        }
+        var it = headersNode.fields();
+        while (it.hasNext()) {
+            var e = it.next();
+            if (e.getKey().equalsIgnoreCase(name)) {
+                JsonNode value = e.getValue().isArray() ? e.getValue().get(0) : e.getValue();
+                return value == null || value.isNull() ? Optional.empty() : Optional.of(value.asText());
+            }
+        }
+        return Optional.empty();
     }
 
     // ──────────────────────────── AWS (non-proxy) ────────────────────────────
@@ -1192,7 +1236,7 @@ public class ApiGatewayExecuteController {
         }
 
         if ("JWT".equalsIgnoreCase(route.getAuthorizationType()) && route.getAuthorizerId() != null) {
-            Response authError = enforceJwtAuthorizer(region, apiId, route, headers);
+            Response authError = enforceJwtAuthorizer(region, apiId, route, headers, uriInfo);
             if (authError != null) return authError;
         }
 
@@ -1421,7 +1465,8 @@ public class ApiGatewayExecuteController {
     /** Extracts parameter names from a route template; the pattern itself is constant. */
     private static final Pattern ROUTE_PARAM_NAMES = Pattern.compile("\\{([a-zA-Z_]+)\\+?\\}");
 
-    private Response enforceJwtAuthorizer(String region, String apiId, Route route, HttpHeaders headers) {
+    private Response enforceJwtAuthorizer(String region, String apiId, Route route, HttpHeaders headers,
+                                          UriInfo uriInfo) {
         Authorizer authorizer;
         try {
             authorizer = apiGatewayV2Service.getAuthorizer(region, apiId, route.getAuthorizerId());
@@ -1431,7 +1476,7 @@ public class ApiGatewayExecuteController {
                     .type(MediaType.APPLICATION_JSON).build();
         }
 
-        String token = extractToken(authorizer, headers);
+        String token = extractToken(authorizer, headers, uriInfo);
         if (token == null) {
             return Response.status(401)
                     .entity(jsonMessage("Unauthorized"))
@@ -1743,7 +1788,7 @@ public class ApiGatewayExecuteController {
         }
     }
 
-    private String extractToken(Authorizer authorizer, HttpHeaders headers) {
+    private String extractToken(Authorizer authorizer, HttpHeaders headers, UriInfo uriInfo) {
         List<String> sources = authorizer.getIdentitySource();
         if (sources == null || sources.isEmpty()) {
             // Default: Authorization header
@@ -1754,6 +1799,10 @@ public class ApiGatewayExecuteController {
             if (source.startsWith("$request.header.")) {
                 String headerName = source.substring("$request.header.".length());
                 String value = headers.getHeaderString(headerName);
+                if (value != null) return stripBearer(value);
+            } else if (source.startsWith("$request.querystring.")) {
+                String paramName = source.substring("$request.querystring.".length());
+                String value = uriInfo.getQueryParameters().getFirst(paramName);
                 if (value != null) return stripBearer(value);
             }
         }
@@ -1890,48 +1939,59 @@ public class ApiGatewayExecuteController {
     // ──────────────────────────── Path matching ────────────────────────────
 
     /**
-     * Finds the best-matching resource for {@code requestPath}.
+     * Finds all matching resources for {@code requestPath}, sorted by specificity.
      * Priority: exact match > template path match (e.g. /items/{id}) > proxy+ wildcard.
      */
-    ApiGatewayResource matchResource(List<ApiGatewayResource> resources, String requestPath) {
+    List<ApiGatewayResource> matchResources(List<ApiGatewayResource> resources, String requestPath) {
+        List<ApiGatewayResource> matches = new ArrayList<>();
         // 1. Exact match
         for (ApiGatewayResource r : resources) {
             if (requestPath.equals(r.getPath())) {
-                return r;
+                matches.add(r);
             }
         }
         // 2. Template path match — /items/{id} matches /items/anything
         for (ApiGatewayResource r : resources) {
             if (r.getPath() != null && r.getPath().contains("{") && !r.getPath().contains("{proxy+}")) {
                 if (pathMatchesTemplate(r.getPath(), requestPath)) {
-                    return r;
+                    matches.add(r);
                 }
             }
         }
         // 3. Proxy+ wildcard — {proxy+} matches longest parent prefix
         // Requires at least one path segment after the parent prefix (except root /{proxy+})
-        ApiGatewayResource best = null;
-        int bestLen = -1;
+        List<ApiGatewayResource> proxyMatches = new ArrayList<>();
         for (ApiGatewayResource r : resources) {
             if (r.getPath() == null || !r.getPath().contains("{proxy+}")) continue;
             String parentPrefix = r.getPath().substring(0, r.getPath().indexOf("{proxy+}"));
             // Root /{proxy+} matches everything including /
             if ("/".equals(parentPrefix)) {
-                if (best == null) {
-                    best = r;
-                    bestLen = 0;
-                }
+                proxyMatches.add(r);
                 continue;
             }
             // Non-root proxy+ requires at least one char after the prefix
             if (requestPath.startsWith(parentPrefix)
-                    && requestPath.length() > parentPrefix.length()
-                    && parentPrefix.length() > bestLen) {
-                best = r;
-                bestLen = parentPrefix.length();
+                    && requestPath.length() > parentPrefix.length()) {
+                proxyMatches.add(r);
             }
         }
-        return best;
+        // Sort proxy matches by parentPrefix length descending
+        proxyMatches.sort((r1, r2) -> {
+            String p1 = r1.getPath().substring(0, r1.getPath().indexOf("{proxy+}"));
+            String p2 = r2.getPath().substring(0, r2.getPath().indexOf("{proxy+}"));
+            return Integer.compare(p2.length(), p1.length());
+        });
+        matches.addAll(proxyMatches);
+        return matches;
+    }
+
+    /**
+     * Finds the best-matching resource for {@code requestPath}.
+     * Priority: exact match > template path match (e.g. /items/{id}) > proxy+ wildcard.
+     */
+    ApiGatewayResource matchResource(List<ApiGatewayResource> resources, String requestPath) {
+        List<ApiGatewayResource> matches = matchResources(resources, requestPath);
+        return matches.isEmpty() ? null : matches.get(0);
     }
 
     /**

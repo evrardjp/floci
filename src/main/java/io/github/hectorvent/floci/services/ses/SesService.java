@@ -24,6 +24,7 @@ import io.github.hectorvent.floci.services.ses.model.EventDestination;
 import io.github.hectorvent.floci.services.ses.model.Identity;
 import io.github.hectorvent.floci.services.ses.model.MessageHeader;
 import io.github.hectorvent.floci.services.ses.model.MessageTag;
+import io.github.hectorvent.floci.services.ses.model.ReceiptRuleSet;
 import io.github.hectorvent.floci.services.ses.model.Topic;
 import io.github.hectorvent.floci.services.ses.model.TopicPreference;
 import io.github.hectorvent.floci.services.ses.model.TrackingOptions;
@@ -87,11 +88,21 @@ public class SesService {
     private final StorageBackend<String, DedicatedIpPool> dedicatedIpPoolStore;
     private final StorageBackend<String, ContactList> contactListStore;
     private final StorageBackend<String, Contact> contactStore;
+    // Identity (sending authorization) policies: key policy::<region>::<identity>::<policyName>,
+    // value the (normalized) policy JSON. One store shared by the v1 and v2 policy APIs.
+    private final StorageBackend<String, String> policyStore;
+    private final StorageBackend<String, ReceiptRuleSet> receiptRuleSetStore;
     // Guards the one-list-per-account check-then-create so concurrent creates can't both pass.
     private final Object contactListCreateLock = new Object();
     // Serializes contact create/update against contact-list deletion so a concurrent delete
     // can't purge the list between validation and the write, leaving an orphaned contact.
     private final Object contactMutationLock = new Object();
+    // Serializes the per-identity policy count check-then-put so concurrent creates can't both pass.
+    private final Object policyMutationLock = new Object();
+    static final int MAX_POLICIES_PER_IDENTITY = 20;
+    // Serializes receipt-rule-set create (check-then-put) and set-active (clear-then-set) so the
+    // one-active-per-region invariant and duplicate-name rejection hold under concurrency.
+    private final Object receiptRuleSetLock = new Object();
     private final SmtpRelay smtpRelay;
     private final ObjectMapper objectMapper;
     private final SesEventPublisher eventPublisher;
@@ -124,6 +135,10 @@ public class SesService {
                 new TypeReference<Map<String, ContactList>>() {});
         this.contactStore = storageFactory.create("ses", "ses-contacts.json",
                 new TypeReference<Map<String, Contact>>() {});
+        this.policyStore = storageFactory.create("ses", "ses-identity-policies.json",
+                new TypeReference<Map<String, String>>() {});
+        this.receiptRuleSetStore = storageFactory.create("ses", "ses-receipt-rule-sets.json",
+                new TypeReference<Map<String, ReceiptRuleSet>>() {});
         this.smtpRelay = smtpRelay;
         this.objectMapper = objectMapper;
         this.eventPublisher = eventPublisher;
@@ -142,12 +157,14 @@ public class SesService {
                StorageBackend<String, DedicatedIpPool> dedicatedIpPoolStore,
                StorageBackend<String, ContactList> contactListStore,
                StorageBackend<String, Contact> contactStore,
+               StorageBackend<String, String> policyStore,
+               StorageBackend<String, ReceiptRuleSet> receiptRuleSetStore,
                SmtpRelay smtpRelay,
                ObjectMapper objectMapper,
                Clock clock) {
         this(identityStore, emailStore, accountSettingsStore, templateStore, configSetStore, suppressionStore,
-                accountSuppressionStore, dedicatedIpPoolStore, contactListStore, contactStore, smtpRelay,
-                objectMapper, null, clock);
+                accountSuppressionStore, dedicatedIpPoolStore, contactListStore, contactStore, policyStore,
+                receiptRuleSetStore, smtpRelay, objectMapper, null, clock);
     }
 
     SesService(StorageBackend<String, Identity> identityStore,
@@ -160,6 +177,8 @@ public class SesService {
                StorageBackend<String, DedicatedIpPool> dedicatedIpPoolStore,
                StorageBackend<String, ContactList> contactListStore,
                StorageBackend<String, Contact> contactStore,
+               StorageBackend<String, String> policyStore,
+               StorageBackend<String, ReceiptRuleSet> receiptRuleSetStore,
                SmtpRelay smtpRelay,
                ObjectMapper objectMapper,
                Route53Service route53Service,
@@ -174,6 +193,8 @@ public class SesService {
         this.dedicatedIpPoolStore = dedicatedIpPoolStore;
         this.contactListStore = contactListStore;
         this.contactStore = contactStore;
+        this.policyStore = policyStore;
+        this.receiptRuleSetStore = receiptRuleSetStore;
         this.smtpRelay = smtpRelay;
         this.objectMapper = objectMapper;
         this.eventPublisher = null;
@@ -232,6 +253,17 @@ public class SesService {
             Identity storedIdentity = identityStore.get(storedKey).orElse(null);
             if (storedIdentity != null && identityValue.equals(storedIdentity.getIdentity())) {
                 identityStore.delete(storedKey);
+            }
+        }
+
+        // Policies are sub-resources of the identity; drop them too so they can't resurrect into a
+        // same-named identity recreated later (and so the per-identity count stays correct).
+        synchronized (policyMutationLock) {
+            String policyPrefix = policyPrefix(region, identityValue);
+            for (String policyKey : new ArrayList<>(policyStore.keys())) {
+                if (policyKey.startsWith(policyPrefix)) {
+                    policyStore.delete(policyKey);
+                }
             }
         }
 
@@ -1261,6 +1293,135 @@ public class SesService {
         return "configSet::" + region + "::" + name;
     }
 
+    // ──────────────────────── Receipt rule sets (inbound) ────────────────────────
+    //
+    // Floci has no inbound-mail endpoint, so receipt rule sets are stored inertly: a set never holds
+    // any rules and routes no mail. They exist only so the management API round-trips (enough to
+    // unblock tools such as Terraform that declare a rule set during bootstrap).
+
+    public ReceiptRuleSet createReceiptRuleSet(String name, String region) {
+        requireRuleSetName(name);
+        String key = receiptRuleSetKey(region, name);
+        ReceiptRuleSet ruleSet = new ReceiptRuleSet(name, Instant.now(clock));
+        synchronized (receiptRuleSetLock) {
+            if (receiptRuleSetStore.get(key).isPresent()) {
+                throw new AwsException("AlreadyExists", "Rule set already exists: " + name, 400);
+            }
+            receiptRuleSetStore.put(key, ruleSet);
+        }
+        LOG.infov("Created SES receipt rule set: {0} in region {1}", name, region);
+        return ruleSet;
+    }
+
+    public ReceiptRuleSet describeReceiptRuleSet(String name, String region) {
+        requireRuleSetName(name);
+        return receiptRuleSetStore.get(receiptRuleSetKey(region, name))
+                .orElseThrow(() -> ruleSetDoesNotExist(name));
+    }
+
+    public List<ReceiptRuleSet> listReceiptRuleSets(String region) {
+        String prefix = "receiptRuleSet::" + region + "::";
+        List<ReceiptRuleSet> all = new ArrayList<>(receiptRuleSetStore.scan(k -> k.startsWith(prefix)));
+        all.sort(Comparator.comparing(ReceiptRuleSet::getCreatedTimestamp,
+                        Comparator.nullsLast(Comparator.naturalOrder()))
+                .thenComparing(ReceiptRuleSet::getName, Comparator.nullsLast(Comparator.naturalOrder())));
+        return all;
+    }
+
+    public void deleteReceiptRuleSet(String name, String region) {
+        requireRuleSetName(name);
+        // Hold the lock so the active-check-then-delete is atomic and a concurrent set-active/clear
+        // (which scans and re-puts active sets) can't resurrect the rule set we just deleted.
+        synchronized (receiptRuleSetLock) {
+            ReceiptRuleSet existing = receiptRuleSetStore.get(receiptRuleSetKey(region, name)).orElse(null);
+            if (existing != null && existing.isActive()) {
+                // AWS rejects deleting the active rule set (verified: CannotDelete / 400).
+                throw new AwsException("CannotDelete", "Cannot delete active rule set: " + name, 400);
+            }
+            // AWS is idempotent otherwise: deleting a non-existent rule set succeeds without error.
+            receiptRuleSetStore.delete(receiptRuleSetKey(region, name));
+        }
+        LOG.infov("Deleted SES receipt rule set: {0} in region {1}", name, region);
+    }
+
+    public void setActiveReceiptRuleSet(String name, String region) {
+        // No RuleSetName clears the account's active rule set (matches AWS).
+        boolean clearOnly = name == null || name.isBlank();
+        if (!clearOnly) {
+            requireRuleSetName(name);
+        }
+        synchronized (receiptRuleSetLock) {
+            if (!clearOnly) {
+                ReceiptRuleSet target = receiptRuleSetStore.get(receiptRuleSetKey(region, name))
+                        .orElseThrow(() -> ruleSetDoesNotExist(name));
+                clearActiveReceiptRuleSet(region);
+                target.setActive(true);
+                receiptRuleSetStore.put(receiptRuleSetKey(region, name), target);
+            } else {
+                clearActiveReceiptRuleSet(region);
+            }
+        }
+        if (clearOnly) {
+            LOG.infov("Cleared active SES receipt rule set in region {0}", region);
+        } else {
+            LOG.infov("Set active SES receipt rule set: {0} in region {1}", name, region);
+        }
+    }
+
+    public ReceiptRuleSet describeActiveReceiptRuleSet(String region) {
+        String prefix = "receiptRuleSet::" + region + "::";
+        // Read under the lock so a concurrent set-active replacement (clear-then-set) can't expose its
+        // intermediate no-active state — the reader sees either the old or the new active set.
+        synchronized (receiptRuleSetLock) {
+            return receiptRuleSetStore.scan(k -> k.startsWith(prefix)).stream()
+                    .filter(ReceiptRuleSet::isActive)
+                    .findFirst()
+                    .orElse(null);
+        }
+    }
+
+    private void clearActiveReceiptRuleSet(String region) {
+        String prefix = "receiptRuleSet::" + region + "::";
+        for (ReceiptRuleSet rs : receiptRuleSetStore.scan(k -> k.startsWith(prefix))) {
+            if (rs.isActive()) {
+                rs.setActive(false);
+                receiptRuleSetStore.put(receiptRuleSetKey(region, rs.getName()), rs);
+            }
+        }
+    }
+
+    // These RuleSetName constraints are not in the botocore model: service-2.json (SES 2010-12-01)
+    // declares ReceiptRuleSetName as a bare {"type": "string"} with no pattern or length. They were
+    // established by probing real SES in us-west-2 via boto3 (2026-08): a character outside
+    // ^[a-zA-Z0-9_.-]+$ is a Smithy ValidationError, and a name that is >64 chars or does not
+    // start/end with an alphanumeric is a service-level "Not a valid ruleSetName" InvalidParameterValue.
+    // Re-verify against live SES (not the model, which can't confirm it) if these ever need to change.
+    private static final Pattern RULE_SET_NAME_CHARS = Pattern.compile("^[a-zA-Z0-9_.-]+$");
+
+    private static void requireRuleSetName(String name) {
+        if (name == null || name.isBlank()) {
+            throw new AwsException("InvalidParameterValue", "RuleSetName is required.", 400);
+        }
+        if (!RULE_SET_NAME_CHARS.matcher(name).matches()) {
+            throw new AwsException("ValidationError",
+                    "1 validation error detected: Value at 'ruleSetName' failed to satisfy constraint: "
+                            + "Member must satisfy regular expression pattern: ^[a-zA-Z0-9_.-]+$", 400);
+        }
+        if (name.length() > 64
+                || !Character.isLetterOrDigit(name.charAt(0))
+                || !Character.isLetterOrDigit(name.charAt(name.length() - 1))) {
+            throw new AwsException("InvalidParameterValue", "Not a valid ruleSetName: " + name, 400);
+        }
+    }
+
+    private static AwsException ruleSetDoesNotExist(String name) {
+        return new AwsException("RuleSetDoesNotExist", "Rule set does not exist: " + name, 400);
+    }
+
+    private static String receiptRuleSetKey(String region, String name) {
+        return "receiptRuleSet::" + region + "::" + name;
+    }
+
     // ──────────────────────── Dedicated IP Pools ────────────────────────
 
     private static final java.util.Set<String> SCALING_MODES = java.util.Set.of("STANDARD", "MANAGED");
@@ -1432,6 +1593,171 @@ public class SesService {
             throw new AwsException("BadRequestException",
                     "List description can contain up to 500 characters.", 400);
         }
+    }
+
+    // ──────────────── Identity (sending authorization) policies ────────────────
+    // One shared store behind the v1 (PutIdentityPolicy/GetIdentityPolicies/ListIdentityPolicies/
+    // DeleteIdentityPolicy) and v2 (Create/Get/Update/DeleteEmailIdentityPolicy) APIs. Verified
+    // against real AWS. Floci stores and returns policies but does not enforce the authorization
+    // (Principal-account existence, Resource-ARN match, or send-time checks) — it has no account
+    // registry and does not gate sending, so these are treated as metadata.
+    private static final Pattern POLICY_NAME_CHARS = Pattern.compile("[A-Za-z0-9_-]+");
+
+    // v1 PutIdentityPolicy: upsert (create or overwrite); v1 does not require the identity to exist.
+    public void putIdentityPolicy(String identity, String policyName, String policy, String region) {
+        validatePolicyName(policyName);
+        String normalized = normalizePolicy(policy);
+        String key = policyKey(region, identity, policyName);
+        synchronized (policyMutationLock) {
+            if (policyStore.get(key).isEmpty()) {
+                enforcePolicyLimit(region, identity, false);
+            }
+            policyStore.put(key, normalized);
+        }
+        LOG.infov("SES PutIdentityPolicy: {0} on {1} (region {2})", policyName, identity, region);
+    }
+
+    // v2 CreateEmailIdentityPolicy: fails if the name already exists; requires the identity.
+    public void createEmailIdentityPolicy(String identity, String policyName, String policy, String region) {
+        requireIdentityExists(identity, region);
+        validatePolicyName(policyName);
+        String normalized = normalizePolicy(policy);
+        String key = policyKey(region, identity, policyName);
+        synchronized (policyMutationLock) {
+            if (policyStore.get(key).isPresent()) {
+                throw new AwsException("AlreadyExistsException",
+                        "Policy <" + policyName + "> already exists", 400);
+            }
+            enforcePolicyLimit(region, identity, true);
+            policyStore.put(key, normalized);
+        }
+        LOG.infov("SES v2 CreateEmailIdentityPolicy: {0} on {1} (region {2})", policyName, identity, region);
+    }
+
+    // v2 UpdateEmailIdentityPolicy: fails if the name is missing; requires the identity.
+    public void updateEmailIdentityPolicy(String identity, String policyName, String policy, String region) {
+        requireIdentityExists(identity, region);
+        validatePolicyName(policyName);
+        String normalized = normalizePolicy(policy);
+        String key = policyKey(region, identity, policyName);
+        synchronized (policyMutationLock) {
+            if (policyStore.get(key).isEmpty()) {
+                throw policyNotFound(policyName);
+            }
+            policyStore.put(key, normalized);
+        }
+        LOG.infov("SES v2 UpdateEmailIdentityPolicy: {0} on {1} (region {2})", policyName, identity, region);
+    }
+
+    // v2 GetEmailIdentityPolicies: all policies for the identity; requires the identity.
+    public Map<String, String> getEmailIdentityPolicies(String identity, String region) {
+        requireIdentityExists(identity, region);
+        return listPolicies(region, identity);
+    }
+
+    // v1 GetIdentityPolicies: requested names only, missing silently omitted; no identity check.
+    public Map<String, String> getIdentityPolicies(String identity, List<String> policyNames, String region) {
+        Map<String, String> out = new LinkedHashMap<>();
+        for (String name : policyNames) {
+            policyStore.get(policyKey(region, identity, name)).ifPresent(doc -> out.put(name, doc));
+        }
+        return out;
+    }
+
+    // v1 ListIdentityPolicies: policy names (sorted); no identity check.
+    public List<String> listIdentityPolicyNames(String identity, String region) {
+        return listPolicies(region, identity).keySet().stream().sorted().toList();
+    }
+
+    // v2 DeleteEmailIdentityPolicy: requires the identity; NotFound if the policy is missing.
+    public void deleteEmailIdentityPolicy(String identity, String policyName, String region) {
+        requireIdentityExists(identity, region);
+        String key = policyKey(region, identity, policyName);
+        synchronized (policyMutationLock) {
+            if (policyStore.get(key).isEmpty()) {
+                throw policyNotFound(policyName);
+            }
+            policyStore.delete(key);
+        }
+        LOG.infov("SES v2 DeleteEmailIdentityPolicy: {0} on {1} (region {2})", policyName, identity, region);
+    }
+
+    // v1 DeleteIdentityPolicy: idempotent; no identity check, no error on a missing policy.
+    public void deleteIdentityPolicy(String identity, String policyName, String region) {
+        policyStore.delete(policyKey(region, identity, policyName));
+        LOG.infov("SES DeleteIdentityPolicy: {0} on {1} (region {2})", policyName, identity, region);
+    }
+
+    private Map<String, String> listPolicies(String region, String identity) {
+        String prefix = policyPrefix(region, identity);
+        Map<String, String> out = new LinkedHashMap<>();
+        for (String key : policyStore.keys()) {
+            if (key.startsWith(prefix)) {
+                policyStore.get(key).ifPresent(doc -> out.put(key.substring(prefix.length()), doc));
+            }
+        }
+        return out;
+    }
+
+    private void enforcePolicyLimit(String region, String identity, boolean v2) {
+        long count = policyStore.keys().stream()
+                .filter(k -> k.startsWith(policyPrefix(region, identity))).count();
+        if (count >= MAX_POLICIES_PER_IDENTITY) {
+            String msg = "Number of policies for <" + identity
+                    + "> exceeds max allowed number of policies per resource";
+            throw new AwsException(v2 ? "LimitExceededException" : "InvalidParameterValue", msg, 400);
+        }
+    }
+
+    private void requireIdentityExists(String identity, String region) {
+        if (identityStore.get(identityKey(region, identity)).isEmpty()) {
+            throw new AwsException("NotFoundException",
+                    "Email identity <" + identity + "> does not exist.", 404);
+        }
+    }
+
+    // Error codes are the v1 (Query) codes verified against AWS; the v2 controller remaps them to
+    // BadRequestException. The messages are identical across v1 and v2.
+    private static void validatePolicyName(String policyName) {
+        if (policyName == null || policyName.isBlank()) {
+            throw new AwsException("InvalidParameterValue", "PolicyName is required.", 400);
+        }
+        if (policyName.length() > 64) {
+            throw new AwsException("ValidationError",
+                    "1 validation error detected: Value at 'policyName' failed to satisfy constraint: "
+                            + "Member must have length less than or equal to 64", 400);
+        }
+        if (!POLICY_NAME_CHARS.matcher(policyName).matches()) {
+            throw new AwsException("InvalidParameterValue",
+                    "PolicyName is invalid. Policy names must only include alpha-numeric characters, "
+                            + "dashes, and underscores.", 400);
+        }
+    }
+
+    private String normalizePolicy(String policy) {
+        if (policy == null || policy.isBlank()) {
+            throw new AwsException("InvalidParameterValue", "Policy is required.", 400);
+        }
+        try {
+            // AWS returns the policy with insignificant whitespace stripped; compact it to match.
+            return objectMapper.readTree(policy).toString();
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            // Floci does not validate policy semantics; keep an unparseable document verbatim.
+            LOG.debugv("Identity policy is not valid JSON, storing as-is: {0}", e.getMessage());
+            return policy;
+        }
+    }
+
+    private static AwsException policyNotFound(String policyName) {
+        return new AwsException("NotFoundException", "Policy <" + policyName + "> does not exist", 404);
+    }
+
+    private static String policyKey(String region, String identity, String policyName) {
+        return policyPrefix(region, identity) + policyName;
+    }
+
+    private static String policyPrefix(String region, String identity) {
+        return "policy::" + region + "::" + identity + "::";
     }
 
     // Validates Create/Update input in the same two-phase order as real AWS (verified by probe):

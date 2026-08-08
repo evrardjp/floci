@@ -2,7 +2,9 @@ package io.github.hectorvent.floci.services.cognito;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
@@ -40,6 +42,14 @@ public class CognitoService {
 
     private static final Logger LOG = Logger.getLogger(CognitoService.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    private static final String IDENTITIES_ATTRIBUTE = "identities";
+
+    // AWS provider types that double as the provider name. SAML and OIDC types are only
+    // knowable from a registered IdP, which floci does not model, so they stay null.
+    private static final Set<String> NAMED_PROVIDER_TYPES =
+            Set.of("Facebook", "Google", "LoginWithAmazon", "SignInWithApple");
+
 
     /**
      * Claim overrides returned by a PreTokenGeneration Lambda trigger.
@@ -981,6 +991,82 @@ public class CognitoService {
         LOG.infov("Reset password for user {0} in pool {1}", user.getUsername(), userPoolId);
     }
 
+    // Serializes adminLinkProviderForUser's check-then-write.
+    private final Object identityLinkLock = new Object();
+
+    public void adminLinkProviderForUser(String userPoolId, String destinationUsername,
+            String sourceProviderName, String sourceUserId) {
+        if (destinationUsername == null || destinationUsername.isEmpty()) {
+            throw new AwsException("InvalidParameterException",
+                    "DestinationUser.ProviderAttributeValue is required.", 400);
+        }
+        if (sourceProviderName == null || sourceProviderName.isEmpty()) {
+            throw new AwsException("InvalidParameterException",
+                    "SourceUser.ProviderName is required.", 400);
+        }
+        if (sourceUserId == null || sourceUserId.isEmpty()) {
+            throw new AwsException("InvalidParameterException",
+                    "SourceUser.ProviderAttributeValue is required.", 400);
+        }
+
+        // The uniqueness check and the write must not interleave with another
+        // link of the same source identity. The UserPool object cannot serve as
+        // the monitor — updateUserPool replaces the stored instance — so links
+        // serialize on a dedicated lock.
+        synchronized (identityLinkLock) {
+            CognitoUser user = adminGetUser(userPoolId, destinationUsername);
+            String prefix = userPoolId + "::";
+            if (userStore.scan(k -> k.startsWith(prefix)).stream()
+                    .anyMatch(u -> hasLinkedIdentity(u, sourceProviderName, sourceUserId))) {
+                throw new AwsException("AliasExistsException",
+                        "Source identity is already linked to a user in this user pool", 400);
+            }
+
+            ArrayNode identities = readIdentities(user);
+            identities.addObject()
+                    .put("userId", sourceUserId)
+                    .put("providerName", sourceProviderName)
+                    .put("providerType",
+                            NAMED_PROVIDER_TYPES.contains(sourceProviderName) ? sourceProviderName : null)
+                    .putNull("issuer")
+                    .put("primary", false)
+                    // AWS emits dateCreated in epoch milliseconds, unlike the seconds this
+                    // service uses for its own user timestamps.
+                    .put("dateCreated", System.currentTimeMillis());
+
+            user.getAttributes().put(IDENTITIES_ATTRIBUTE, identities.toString());
+            user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+            userStore.put(userKey(userPoolId, user.getUsername()), user);
+            LOG.infov("Linked {0} identity {1} to user {2} in pool {3}",
+                    sourceProviderName, sourceUserId, user.getUsername(), userPoolId);
+        }
+    }
+
+    private boolean hasLinkedIdentity(CognitoUser user, String providerName, String userId) {
+        for (JsonNode identity : readIdentities(user)) {
+            if (providerName.equals(identity.path("providerName").asText())
+                    && userId.equals(identity.path("userId").asText())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private ArrayNode readIdentities(CognitoUser user) {
+        String raw = user.getAttributes().get(IDENTITIES_ATTRIBUTE);
+        if (raw != null && !raw.isBlank()) {
+            try {
+                if (MAPPER.readTree(raw) instanceof ArrayNode stored) {
+                    return stored;
+                }
+                LOG.warnv("Discarding non-array identities attribute for user {0}", user.getUsername());
+            } catch (JsonProcessingException e) {
+                LOG.warnv(e, "Discarding malformed identities attribute for user {0}", user.getUsername());
+            }
+        }
+        return MAPPER.createArrayNode();
+    }
+
     public List<CognitoUser> listUsers(String userPoolId, String filter) {
         String prefix = userPoolId + "::";
         List<CognitoUser> all = userStore.scan(k -> k.startsWith(prefix));
@@ -1249,6 +1335,51 @@ public class CognitoService {
         }
         return Map.of("AttributeName", deliveryTarget.attributeName(), "DeliveryMedium",
                 deliveryTarget.deliveryMedium(), "Destination", deliveryTarget.destination());
+    }
+
+    public Map<String, String> resendConfirmationCode(String clientId, String username) {
+        UserPoolClient client = clientStore.get(clientId)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Client not found",
+                        400));
+        UserPool pool = describeUserPool(client.getUserPoolId());
+        CognitoUser user = adminGetUser(client.getUserPoolId(), username);
+        if (!"UNCONFIRMED".equals(user.getUserStatus())) {
+            throw new AwsException("NotAuthorizedException",
+                    "User cannot be confirmed. Current status is " + user.getUserStatus(), 400);
+        }
+        if (!isSignUpConfirmationEnabled(pool)) {
+            throw new AwsException("InvalidParameterException",
+                    "User pool does not have sign-up confirmation delivery configured", 400);
+        }
+
+        DeliveryTarget deliveryTarget = resolveSignUpDeliveryTarget(pool, user);
+        if (deliveryTarget == null) {
+            throw new AwsException("InvalidParameterException",
+                    "Cannot confirm user because email or phone_number is missing", 400);
+        }
+
+        ensureVerificationWiring();
+        verificationCodeService.invalidatePrevious(pool.getId(), user.getUsername(),
+                VerificationCode.Purpose.SIGNUP_CONFIRMATION);
+        try {
+            String code = verificationCodeService.issue(pool.getId(), user.getUsername(),
+                    VerificationCode.Purpose.SIGNUP_CONFIRMATION, Duration.ofHours(24));
+            messageDispatcher.dispatch(pool, user, VerificationCode.Purpose.SIGNUP_CONFIRMATION,
+                    code, List.of(deliveryTarget.deliveryMedium()));
+        } catch (VerificationCodeException e) {
+            throw mapVerificationCodeException(e);
+        } catch (RuntimeException e) {
+            verificationCodeService.invalidatePrevious(pool.getId(), user.getUsername(),
+                    VerificationCode.Purpose.SIGNUP_CONFIRMATION);
+            throw new AwsException("CodeDeliveryFailureException",
+                    "Failed to deliver the message.", 400);
+        }
+
+        return Map.of(
+                "AttributeName", deliveryTarget.attributeName(),
+                "DeliveryMedium", deliveryTarget.deliveryMedium(),
+                "Destination", deliveryTarget.destination()
+        );
     }
 
     public void adminConfirmSignUp(String userPoolId, String username) {
@@ -2488,19 +2619,15 @@ public class CognitoService {
         List<String> autoVerifiedAttributes =
                 pool.getAutoVerifiedAttributes() != null ? pool.getAutoVerifiedAttributes()
                         : List.of();
-        for (String attribute : autoVerifiedAttributes) {
-            if ("email".equals(attribute)) {
-                String email = blankToNull(attributes.get("email"));
-                if (email != null) {
-                    return new DeliveryTarget("email", "EMAIL", maskEmail(email));
-                }
-            }
-            if ("phone_number".equals(attribute)) {
-                String phoneNumber = blankToNull(attributes.get("phone_number"));
-                if (phoneNumber != null) {
-                    return new DeliveryTarget("phone_number", "SMS", maskPhoneNumber(phoneNumber));
-                }
-            }
+
+        String phoneNumber = blankToNull(attributes.get("phone_number"));
+        if (autoVerifiedAttributes.contains("phone_number") && phoneNumber != null) {
+            return new DeliveryTarget("phone_number", "SMS", maskPhoneNumber(phoneNumber));
+        }
+
+        String email = blankToNull(attributes.get("email"));
+        if (autoVerifiedAttributes.contains("email") && email != null) {
+            return new DeliveryTarget("email", "EMAIL", maskEmail(email));
         }
 
         return null;
